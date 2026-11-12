@@ -1,18 +1,19 @@
-import type { Backend, Identity, Quota, RateLimitResult, VerifyResult } from "@gatekit/core";
+import type { Admission, Backend, Identity, Quota } from "@gatekit/core";
 import { type HTTPClient, Unkey } from "@unkey/api";
+
+export type UnkeyVerifyRequest = {
+  key: string;
+  ratelimits?: Array<{
+    name: string;
+    limit?: number;
+    duration?: number;
+    cost?: number;
+  }>;
+};
 
 export type UnkeyClient = {
   keys: {
-    verifyKey(request: { key: string }): Promise<unknown>;
-  };
-  ratelimit: {
-    limit(request: {
-      namespace: string;
-      identifier: string;
-      limit: number;
-      duration: number;
-      cost?: number;
-    }): Promise<unknown>;
+    verifyKey(request: UnkeyVerifyRequest): Promise<unknown>;
   };
 };
 
@@ -42,37 +43,45 @@ function stringList(value: unknown): string[] {
   return permissions;
 }
 
-function absoluteReset(reset: number, now: number): number {
-  if (reset > 1_000_000_000_000) return reset;
-  return now + reset;
+function pickRatelimit(
+  data: Record<string, unknown>,
+  preferredName: string | undefined,
+): Record<string, unknown> | undefined {
+  const entries = data.ratelimits;
+  if (!Array.isArray(entries)) return undefined;
+  const records = entries.filter(isRecord);
+  if (preferredName !== undefined) {
+    const named = records.find((entry) => entry.name === preferredName);
+    if (named !== undefined) return named;
+  }
+  return records.find((entry) => entry.exceeded === true) ?? records[0];
 }
 
-function quotaFromVerify(data: Record<string, unknown>, now: number): Quota {
-  const entries = data.ratelimits;
-  const first = Array.isArray(entries) ? entries.find(isRecord) : undefined;
-  if (first === undefined) {
-    return { name: "default", limit: 0, remaining: 0, reset: now, windowMs: 1000 };
+function quotaFromEntry(entry: Record<string, unknown>, now: number): Quota | undefined {
+  const limit = numberField(entry, "limit");
+  const remaining = numberField(entry, "remaining");
+  const duration = numberField(entry, "duration");
+  const reset = numberField(entry, "reset");
+  if (
+    limit === undefined ||
+    remaining === undefined ||
+    duration === undefined ||
+    reset === undefined ||
+    typeof entry.name !== "string" ||
+    entry.name.length === 0
+  ) {
+    return undefined;
   }
-  const duration = numberField(first, "duration") ?? 1000;
-  const resetField = numberField(first, "reset");
   return {
-    name: typeof first.name === "string" && first.name.length > 0 ? first.name : "default",
-    limit: numberField(first, "limit") ?? 0,
-    remaining: numberField(first, "remaining") ?? 0,
-    reset: resetField === undefined ? now + duration : absoluteReset(resetField, now),
+    name: entry.name,
+    limit,
+    remaining,
+    reset: now + reset,
     windowMs: Math.max(1, duration),
   };
 }
 
-function parseVerifyResponse(value: unknown, now: number): VerifyResult {
-  const data = dataOf(value);
-  if (typeof data.code !== "string" || typeof data.valid !== "boolean") {
-    throw new Error("unkey verify response is missing valid or code");
-  }
-  if (data.code === "RATE_LIMITED") {
-    return { ok: false, reason: "rate_limited", quota: quotaFromVerify(data, now) };
-  }
-  if (!data.valid || data.code !== "VALID") return { ok: false, reason: "unauthorized" };
+function readIdentity(data: Record<string, unknown>): Identity {
   if (typeof data.keyId !== "string" || data.keyId.length === 0) {
     throw new Error("unkey verify response is missing keyId");
   }
@@ -81,7 +90,7 @@ function parseVerifyResponse(value: unknown, now: number): VerifyResult {
     isRecord(identityRecord) && typeof identityRecord.externalId === "string"
       ? identityRecord.externalId
       : undefined;
-  const identity: Identity = {
+  return {
     keyId: data.keyId,
     meta: isRecord(data.meta) ? { ...data.meta } : {},
     permissions: stringList(data.permissions),
@@ -89,23 +98,27 @@ function parseVerifyResponse(value: unknown, now: number): VerifyResult {
     ...(typeof data.expires === "number" ? { expiresAt: data.expires } : {}),
     ...(externalId !== undefined ? { externalId } : {}),
   };
-  return { ok: true, identity };
 }
 
-function parseLimitResponse(value: unknown): RateLimitResult {
+function parseVerifyResponse(
+  value: unknown,
+  now: number,
+  preferredName: string | undefined,
+): Admission {
   const data = dataOf(value);
-  const limit = numberField(data, "limit");
-  const remaining = numberField(data, "remaining");
-  const reset = numberField(data, "reset");
-  if (
-    typeof data.success !== "boolean" ||
-    limit === undefined ||
-    remaining === undefined ||
-    reset === undefined
-  ) {
-    throw new Error("unkey ratelimit response is incomplete");
+  if (typeof data.code !== "string" || typeof data.valid !== "boolean") {
+    throw new Error("unkey verify response is missing valid or code");
   }
-  return { success: data.success, limit, remaining, reset };
+  const entry = pickRatelimit(data, preferredName);
+  const quota = entry === undefined ? undefined : quotaFromEntry(entry, now);
+  if (data.code === "RATE_LIMITED") {
+    if (quota === undefined) throw new Error("unkey rate limit response is incomplete");
+    return { ok: false, reason: "rate_limited", quota };
+  }
+  if (!data.valid || data.code !== "VALID") return { ok: false, reason: "unauthorized" };
+  const identity = readIdentity(data);
+  if (quota === undefined) return { ok: true, identity };
+  return { ok: true, identity, rateLimit: quota };
 }
 
 function sdkClient(rootKey: string, httpClient?: HTTPClient): UnkeyClient {
@@ -118,37 +131,35 @@ function sdkClient(rootKey: string, httpClient?: HTTPClient): UnkeyClient {
     keys: {
       verifyKey: (request) => sdk.keys.verifyKey(request),
     },
-    ratelimit: {
-      limit: (request) => sdk.ratelimit.limit(request),
-    },
   };
 }
 
 export function unkey(options: {
   readonly rootKey: string;
-  readonly namespace?: string;
   readonly client?: UnkeyClient;
   readonly httpClient?: HTTPClient;
 }): Backend {
   if (options.rootKey.length === 0) throw new Error("rootKey must be a non-empty string");
-  const namespace = options.namespace ?? "gatekit";
-  if (namespace.length === 0) throw new Error("namespace must be a non-empty string");
   const client = options.client ?? sdkClient(options.rootKey, options.httpClient);
 
   return {
-    async verifyKey({ key, now }) {
-      return parseVerifyResponse(await client.keys.verifyKey({ key }), now);
-    },
-    async consume(input) {
-      return parseLimitResponse(
-        await client.ratelimit.limit({
-          namespace,
-          identifier: input.identifier,
-          limit: input.limit,
-          duration: input.windowMs,
-          cost: input.cost,
-        }),
-      );
+    async admit(input) {
+      const rateLimit = input.rateLimit;
+      const request: UnkeyVerifyRequest =
+        rateLimit === undefined
+          ? { key: input.key }
+          : {
+              key: input.key,
+              ratelimits: [
+                {
+                  name: rateLimit.name,
+                  limit: rateLimit.limit,
+                  duration: rateLimit.windowMs,
+                  cost: rateLimit.cost,
+                },
+              ],
+            };
+      return parseVerifyResponse(await client.keys.verifyKey(request), input.now, rateLimit?.name);
     },
   };
 }

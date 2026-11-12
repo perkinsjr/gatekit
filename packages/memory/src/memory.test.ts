@@ -74,18 +74,19 @@ describe("memory backend", () => {
     const backend = memory({ keys: [{ key: "sk_live", keyId: "key_live" }] });
     const results = await Promise.all(
       Array.from({ length: 20 }, () =>
-        backend.consume({
-          identifier: "key_live",
-          limit: 5,
-          windowMs: 60_000,
-          cost: 1,
+        backend.admit({
+          key: "sk_live",
           now: 10_000,
+          headers: new Headers(),
+          rateLimit: { name: "default", limit: 5, windowMs: 60_000, cost: 1 },
         }),
       ),
     );
-    expect(results.filter((result) => result.success)).toHaveLength(5);
+    expect(results.filter((result) => result.ok)).toHaveLength(5);
     expect(
-      results.filter((result) => !result.success).every((result) => result.remaining === 0),
+      results
+        .filter((result) => !result.ok)
+        .every((result) => result.reason === "rate_limited" && result.quota.remaining === 0),
     ).toBe(true);
   });
 

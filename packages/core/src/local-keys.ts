@@ -1,5 +1,9 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import type { Identity, KeyRecord, VerifyResult } from "./types.js";
+import type { Identity, KeyRecord } from "./types.js";
+
+type KeyCheck =
+  | { readonly ok: true; readonly identity: Identity }
+  | { readonly ok: false; readonly reason: "unauthorized" };
 
 type StoredKey = {
   readonly hash: Buffer;
@@ -19,7 +23,7 @@ function assertPlainObject(value: unknown, label: string): Readonly<Record<strin
 }
 
 export function createLocalVerifier(records: readonly KeyRecord[]): {
-  verify(key: string, now: number): VerifyResult;
+  verify(key: string, now: number): KeyCheck;
 } {
   const stored: StoredKey[] = [];
   const seenIds = new Set<string>();
@@ -75,7 +79,7 @@ export function createLocalVerifier(records: readonly KeyRecord[]): {
   }
 
   return {
-    verify(key: string, now: number): VerifyResult {
+    verify(key: string, now: number): KeyCheck {
       const incoming = hashKey(key);
       let match: StoredKey | undefined;
       for (const candidate of stored) {

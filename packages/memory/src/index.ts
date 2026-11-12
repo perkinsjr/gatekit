@@ -1,4 +1,4 @@
-import type { Backend, KeyRecord, RateLimitResult } from "@gatekit/core";
+import type { AdmitInput, Backend, Identity, KeyRecord, Quota } from "@gatekit/core";
 import { applySlidingWindow, createLocalVerifier } from "@gatekit/core";
 
 export function memory(options: { readonly keys: readonly KeyRecord[] }): Backend {
@@ -7,24 +7,46 @@ export function memory(options: { readonly keys: readonly KeyRecord[] }): Backen
   const tails = new Map<string, Promise<void>>();
 
   return {
-    async verifyKey({ key, now }) {
-      return verifier.verify(key, now);
-    },
-    consume(input) {
-      return exclusive(tails, input.identifier, () => {
-        const current = buckets.get(input.identifier) ?? [];
-        const next = applySlidingWindow(current, input);
-        buckets.set(input.identifier, next.timestamps);
-        const result: RateLimitResult = {
-          success: next.success,
-          limit: input.limit,
-          remaining: next.remaining,
-          reset: next.reset,
-        };
-        return result;
+    async admit(input) {
+      const verified = verifier.verify(input.key, input.now);
+      if (!verified.ok) return verified;
+      const rateLimit = input.rateLimit;
+      if (rateLimit === undefined) return { ok: true, identity: verified.identity };
+
+      const identifier = await resolveIdentifier(input, verified.identity);
+      const next = await exclusive(tails, identifier, () => {
+        const current = buckets.get(identifier) ?? [];
+        const applied = applySlidingWindow(current, {
+          now: input.now,
+          windowMs: rateLimit.windowMs,
+          limit: rateLimit.limit,
+          cost: rateLimit.cost,
+        });
+        buckets.set(identifier, applied.timestamps);
+        return applied;
       });
+      const quota: Quota = {
+        name: rateLimit.name,
+        limit: rateLimit.limit,
+        remaining: next.remaining,
+        reset: next.reset,
+        windowMs: rateLimit.windowMs,
+      };
+      if (!next.success) return { ok: false, reason: "rate_limited", quota };
+      return { ok: true, identity: verified.identity, rateLimit: quota };
     },
   };
+}
+
+async function resolveIdentifier(input: AdmitInput, identity: Identity): Promise<string> {
+  const rateLimit = input.rateLimit;
+  const identifier = rateLimit?.identify
+    ? await rateLimit.identify({ identity, headers: input.headers })
+    : identity.keyId;
+  if (typeof identifier !== "string" || identifier.length === 0) {
+    throw new Error("rate limit identifier must be a non-empty string");
+  }
+  return identifier;
 }
 
 function exclusive<T>(tails: Map<string, Promise<void>>, key: string, fn: () => T): Promise<T> {

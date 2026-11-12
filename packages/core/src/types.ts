@@ -26,34 +26,31 @@ export type Quota = {
   readonly windowMs: number;
 };
 
-export type VerifyResult =
-  | { readonly ok: true; readonly identity: Identity }
+export type Admission =
+  | { readonly ok: true; readonly identity: Identity; readonly rateLimit?: Quota }
   | { readonly ok: false; readonly reason: "unauthorized" }
   | { readonly ok: false; readonly reason: "rate_limited"; readonly quota: Quota };
 
-export type RateLimitResult = {
-  readonly success: boolean;
-  readonly limit: number;
-  readonly remaining: number;
-  readonly reset: number;
-};
-
-export type VerifyInput = {
-  readonly key: string;
-  readonly now: number;
-};
-
-export type ConsumeInput = {
-  readonly identifier: string;
+export type AdmitRateLimit = {
+  readonly name: string;
   readonly limit: number;
   readonly windowMs: number;
   readonly cost: number;
+  readonly identify?: (input: {
+    readonly identity: Identity;
+    readonly headers: Headers;
+  }) => string | Promise<string>;
+};
+
+export type AdmitInput = {
+  readonly key: string;
   readonly now: number;
+  readonly headers: Headers;
+  readonly rateLimit?: AdmitRateLimit;
 };
 
 export type Backend = {
-  verifyKey(input: VerifyInput): Promise<VerifyResult>;
-  consume(input: ConsumeInput): Promise<RateLimitResult>;
+  admit(input: AdmitInput): Promise<Admission>;
 };
 
 export type Problem = {
@@ -95,10 +92,7 @@ export type RateLimitOptions = {
   readonly windowMs: number;
   readonly name?: string;
   readonly cost?: number;
-  readonly identify?: (input: {
-    readonly identity: Identity;
-    readonly headers: Headers;
-  }) => string | Promise<string>;
+  readonly identify?: AdmitRateLimit["identify"];
 };
 
 export type KeySourceOptions = {

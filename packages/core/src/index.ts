@@ -8,9 +8,11 @@ export {
   toResponse,
 } from "./problem.js";
 export type {
+  Admission,
+  AdmitInput,
+  AdmitRateLimit,
   AllowDecision,
   Backend,
-  ConsumeInput,
   Decision,
   Gate,
   GateOptions,
@@ -21,11 +23,8 @@ export type {
   ProtectInput,
   Quota,
   RateLimitOptions,
-  RateLimitResult,
   RejectDecision,
   SlidingWindowInput,
   SlidingWindowState,
-  VerifyInput,
-  VerifyResult,
 } from "./types.js";
 export { applySlidingWindow } from "./window.js";

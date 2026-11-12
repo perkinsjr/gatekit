@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createGate } from "./gate.js";
-import type { Backend, ConsumeInput, Identity, RateLimitResult } from "./types.js";
+import type { AdmitInput, Backend, Identity } from "./types.js";
 
 const identity: Identity = {
   keyId: "key_1",
@@ -9,27 +9,34 @@ const identity: Identity = {
   permissions: ["read"],
 };
 
-function countingBackend(limit: number): Backend & { calls: ConsumeInput[] } {
-  const calls: ConsumeInput[] = [];
+function countingBackend(limit: number): Backend & { calls: AdmitInput[]; identifiers: string[] } {
+  const calls: AdmitInput[] = [];
+  const identifiers: string[] = [];
   let used = 0;
   return {
     calls,
-    async verifyKey({ key }) {
-      if (key !== "sk_test") return { ok: false, reason: "unauthorized" };
-      return { ok: true, identity };
-    },
-    async consume(input) {
+    identifiers,
+    async admit(input) {
       calls.push(input);
-      used += input.cost;
+      if (input.key !== "sk_test") return { ok: false, reason: "unauthorized" };
+      const rateLimit = input.rateLimit;
+      if (rateLimit === undefined) return { ok: true, identity };
+      const identifier = rateLimit.identify
+        ? await rateLimit.identify({ identity, headers: input.headers })
+        : identity.keyId;
+      identifiers.push(identifier);
+      used += rateLimit.cost;
       const success = used <= limit;
-      if (!success) used -= input.cost;
-      const result: RateLimitResult = {
-        success,
+      if (!success) used -= rateLimit.cost;
+      const quota = {
+        name: rateLimit.name,
         limit,
         remaining: Math.max(0, limit - used),
-        reset: input.now + input.windowMs,
+        reset: input.now + rateLimit.windowMs,
+        windowMs: rateLimit.windowMs,
       };
-      return result;
+      if (!success) return { ok: false, reason: "rate_limited", quota };
+      return { ok: true, identity, rateLimit: quota };
     },
   };
 }
@@ -58,7 +65,8 @@ describe("createGate", () => {
     expect(rejected.kind === "reject" && missing.kind === "reject" ? rejected.problem : {}).toEqual(
       missing.kind === "reject" ? missing.problem : {},
     );
-    expect(backend.calls).toHaveLength(0);
+    expect(backend.calls).toHaveLength(1);
+    expect(backend.calls[0]?.key).toBe("wrong");
   });
 
   it("accepts a bearer token in any scheme case and attaches the identity", async () => {
@@ -83,7 +91,7 @@ describe("createGate", () => {
     expect(decision.kind).toBe("allow");
   });
 
-  it("returns 429 from the backend result and does not call the handler quota twice", async () => {
+  it("returns 429 once the backend reports the limit is full", async () => {
     const backend = countingBackend(1);
     const headers = new Headers({ authorization: "Bearer sk_test" });
     const first = await protect(headers, backend);
@@ -110,15 +118,12 @@ describe("createGate", () => {
       },
     });
     await gate.protect({ headers: new Headers({ authorization: "Bearer sk_test" }) });
-    expect(backend.calls[0]?.identifier).toBe("user:key_1");
+    expect(backend.identifiers[0]).toBe("user:key_1");
   });
 
   it("turns a backend failure into 503 without a rate limit header", async () => {
     const backend: Backend = {
-      async verifyKey() {
-        throw new Error("redis down");
-      },
-      async consume() {
+      async admit() {
         throw new Error("redis down");
       },
     };
@@ -134,17 +139,14 @@ describe("createGate", () => {
     });
   });
 
-  it("passes a key rate limit from verification through as 429", async () => {
+  it("passes a rate limit from the backend through as 429", async () => {
     const backend: Backend = {
-      async verifyKey() {
+      async admit() {
         return {
-          ok: false as const,
-          reason: "rate_limited" as const,
+          ok: false,
+          reason: "rate_limited",
           quota: { name: "tokens", limit: 4, remaining: 0, reset: 9_000, windowMs: 5_000 },
         };
-      },
-      async consume() {
-        throw new Error("consume should not run");
       },
     };
     const decision = await protect(
@@ -165,6 +167,7 @@ describe("createGate", () => {
       headers: new Headers({ authorization: "Bearer sk_test" }),
     });
     expect(decision).toMatchObject({ kind: "allow", headers: {} });
-    expect(backend.calls).toHaveLength(0);
+    expect(backend.calls).toHaveLength(1);
+    expect(backend.calls[0]?.rateLimit).toBeUndefined();
   });
 });

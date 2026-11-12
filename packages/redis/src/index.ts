@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Backend, KeyRecord, RateLimitResult } from "@gatekit/core";
+import type { AdmitInput, Backend, Identity, KeyRecord, Quota } from "@gatekit/core";
 import { createLocalVerifier } from "@gatekit/core";
 
 export type RedisEvalClient = {
@@ -43,7 +43,12 @@ expire_at(reset)
 return {0, limit, 0, reset}
 `;
 
-function readReply(value: unknown): RateLimitResult {
+function readReply(value: unknown): {
+  success: boolean;
+  limit: number;
+  remaining: number;
+  reset: number;
+} {
   if (!Array.isArray(value) || value.length !== 4) throw new Error("unexpected redis reply");
   const numbers = value.map((part) => Number(part));
   const success = numbers[0];
@@ -75,21 +80,43 @@ export function redis(options: {
   if (prefix.length === 0) throw new Error("prefix must be a non-empty string");
 
   return {
-    async verifyKey({ key, now }) {
-      return verifier.verify(key, now);
-    },
-    async consume(input) {
+    async admit(input) {
+      const verified = verifier.verify(input.key, input.now);
+      if (!verified.ok) return verified;
+      const rateLimit = input.rateLimit;
+      if (rateLimit === undefined) return { ok: true, identity: verified.identity };
+
+      const identifier = await resolveIdentifier(input, verified.identity);
       const reply = await options.client.eval(
         SLIDING_WINDOW,
         1,
-        `${prefix}:rl:${input.identifier}`,
+        `${prefix}:rl:${identifier}`,
         String(input.now),
-        String(input.windowMs),
-        String(input.limit),
-        String(input.cost),
+        String(rateLimit.windowMs),
+        String(rateLimit.limit),
+        String(rateLimit.cost),
         randomUUID(),
       );
-      return readReply(reply);
+      const result = readReply(reply);
+      const quota: Quota = {
+        name: rateLimit.name,
+        limit: result.limit,
+        remaining: result.remaining,
+        reset: result.reset,
+        windowMs: rateLimit.windowMs,
+      };
+      if (!result.success) return { ok: false, reason: "rate_limited", quota };
+      return { ok: true, identity: verified.identity, rateLimit: quota };
     },
   };
+}
+
+async function resolveIdentifier(input: AdmitInput, identity: Identity): Promise<string> {
+  const identifier = input.rateLimit?.identify
+    ? await input.rateLimit.identify({ identity, headers: input.headers })
+    : identity.keyId;
+  if (typeof identifier !== "string" || identifier.length === 0) {
+    throw new Error("rate limit identifier must be a non-empty string");
+  }
+  return identifier;
 }

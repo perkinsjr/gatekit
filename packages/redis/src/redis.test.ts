@@ -88,16 +88,15 @@ describe("redis backend", () => {
     });
     const results = await Promise.all(
       Array.from({ length: 20 }, () =>
-        backend.consume({
-          identifier: "shared",
-          limit: 5,
-          windowMs: 60_000,
-          cost: 1,
+        backend.admit({
+          key: "sk_live",
           now: 50_000,
+          headers: new Headers(),
+          rateLimit: { name: "default", limit: 5, windowMs: 60_000, cost: 1 },
         }),
       ),
     );
-    expect(results.filter((result) => result.success)).toHaveLength(5);
+    expect(results.filter((result) => result.ok)).toHaveLength(5);
     await connection.del(...(await connection.keys(`${prefix}:rl:*`)));
   });
 
@@ -106,33 +105,22 @@ describe("redis backend", () => {
     const prefix = `gatekit:test:${crypto.randomUUID()}`;
     const backend = redis({
       client: connection as RedisEvalClient,
-      keys: [],
+      keys: [{ key: "sk_cost", keyId: "key_cost" }],
       prefix,
     });
-    const first = await backend.consume({
-      identifier: "cost",
-      limit: 5,
-      windowMs: 1_000,
-      cost: 3,
-      now: 10,
-    });
-    const second = await backend.consume({
-      identifier: "cost",
-      limit: 5,
-      windowMs: 1_000,
-      cost: 3,
-      now: 20,
-    });
-    const third = await backend.consume({
-      identifier: "cost",
-      limit: 5,
-      windowMs: 1_000,
-      cost: 2,
-      now: 30,
-    });
-    expect(first).toMatchObject({ success: true, remaining: 2 });
-    expect(second).toMatchObject({ success: false, remaining: 0 });
-    expect(third).toMatchObject({ success: true, remaining: 0 });
+    const admit = (now: number, cost: number) =>
+      backend.admit({
+        key: "sk_cost",
+        now,
+        headers: new Headers(),
+        rateLimit: { name: "default", limit: 5, windowMs: 1_000, cost },
+      });
+    const first = await admit(10, 3);
+    const second = await admit(20, 3);
+    const third = await admit(30, 2);
+    expect(first).toMatchObject({ ok: true, rateLimit: { remaining: 2 } });
+    expect(second).toMatchObject({ ok: false, reason: "rate_limited", quota: { remaining: 0 } });
+    expect(third).toMatchObject({ ok: true, rateLimit: { remaining: 0 } });
     await connection.del(...(await connection.keys(`${prefix}:rl:*`)));
   });
 });

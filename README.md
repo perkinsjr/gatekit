@@ -59,7 +59,22 @@ const gate = createGate({
 });
 ```
 
-`UNKEY_ROOT_KEY` needs permission to verify keys and to call `ratelimit.limit` in the `gatekit` namespace. Pass `namespace` if you already have one. The limit in `rateLimit` is sent on each `ratelimit.limit` call. A key that Unkey itself marks `RATE_LIMITED` during verification returns `429` and does not consume the gate limit again. A failed call to Unkey returns `503` and is not retried inside the middleware.
+`UNKEY_ROOT_KEY` needs permission to verify keys. Any one of these is enough.
+
+- `api.*.verify_key`
+- `api.<api_id>.verify_key`
+- `unkey:v1:<workspace_id>:keyspaces/* /keys/*#verify_key`
+
+Each request is one `keys.verifyKey` call. When `rateLimit` is set, the body carries that limit on the key's ratelimit of the same name.
+
+```json
+{
+  "key": "sk_live_...",
+  "ratelimits": [{ "name": "default", "limit": 10, "duration": 60000, "cost": 1 }]
+}
+```
+
+`name` is `rateLimit.name`, which defaults to `default`. `duration` is `windowMs`. Without `rateLimit`, the body is `{ "key": "..." }` and limits already configured on the key still apply. A `RATE_LIMITED` result is `429`. The `RateLimit` headers use the ratelimit entry in the verify response. `reset` on that entry is a duration in milliseconds. A failed call returns `503` and is not retried.
 
 ## Redis
 
@@ -114,7 +129,7 @@ RateLimit: "default";r=7;t=30
 
 `keys.header` defaults to `authorization`. `keys.scheme` defaults to `bearer`. Set `scheme` to `null` to use the raw header value, which is what you want for `x-api-key`.
 
-`rateLimit.identify` replaces the default bucket id, which is `identity.keyId`. The string you return is the Redis key suffix and the Unkey identifier. Invalid keys do not consume a bucket.
+`rateLimit.identify` replaces the memory bucket and the Redis key suffix. The default is `identity.keyId`. Invalid keys do not consume a bucket. Unkey limits the key itself, so `identify` is not sent to Unkey.
 
 `now` injects the clock. Tests use it. Production can leave it unset.
 

@@ -1,16 +1,6 @@
 import { rateLimitHeaders } from "./headers.js";
 import { rateLimitedDecision, unauthorizedDecision, unavailableDecision } from "./problem.js";
-import type {
-  Backend,
-  ConsumeInput,
-  Decision,
-  Gate,
-  GateOptions,
-  Quota,
-  RateLimitOptions,
-  RateLimitResult,
-  VerifyResult,
-} from "./types.js";
+import type { Admission, Backend, Decision, Gate, GateOptions, RateLimitOptions } from "./types.js";
 
 const HEADER_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
@@ -51,30 +41,18 @@ function readKey(headers: Headers, headerName: string, scheme: string | null): s
   return token;
 }
 
-async function readVerify(
+async function readAdmission(
   backend: Backend,
-  key: string,
-  now: number,
-): Promise<VerifyResult | Decision> {
+  input: Parameters<Backend["admit"]>[0],
+): Promise<Admission | Decision> {
   try {
-    return await backend.verifyKey({ key, now });
+    return await backend.admit(input);
   } catch {
     return unavailableDecision();
   }
 }
 
-async function readConsume(
-  backend: Backend,
-  input: ConsumeInput,
-): Promise<RateLimitResult | Decision> {
-  try {
-    return await backend.consume(input);
-  } catch {
-    return unavailableDecision();
-  }
-}
-
-function isDecision(value: VerifyResult | RateLimitResult | Decision): value is Decision {
+function isDecision(value: Admission | Decision): value is Decision {
   return "kind" in value;
 }
 
@@ -88,8 +66,7 @@ export function createGate(options: GateOptions): Gate {
   }
   if (options.rateLimit) assertRateLimit(options.rateLimit);
   const nowFn = options.now ?? Date.now;
-  const policyName = options.rateLimit?.name ?? "default";
-  const cost = options.rateLimit?.cost ?? 1;
+  const rateLimit = options.rateLimit;
 
   return {
     async protect({ headers }): Promise<Decision> {
@@ -97,47 +74,35 @@ export function createGate(options: GateOptions): Gate {
       const key = readKey(headers, headerName, scheme);
       if (key === undefined) return unauthorizedDecision();
 
-      const verified = await readVerify(options.backend, key, now);
-      if (isDecision(verified)) return verified;
-      if (!verified.ok) {
-        if (verified.reason === "rate_limited") return rateLimitedDecision(verified.quota, now);
+      const admission = await readAdmission(options.backend, {
+        key,
+        now,
+        headers,
+        ...(rateLimit === undefined
+          ? {}
+          : {
+              rateLimit: {
+                name: rateLimit.name ?? "default",
+                limit: rateLimit.limit,
+                windowMs: rateLimit.windowMs,
+                cost: rateLimit.cost ?? 1,
+                ...(rateLimit.identify === undefined ? {} : { identify: rateLimit.identify }),
+              },
+            }),
+      });
+      if (isDecision(admission)) return admission;
+      if (!admission.ok) {
+        if (admission.reason === "rate_limited") return rateLimitedDecision(admission.quota, now);
         return unauthorizedDecision();
       }
-
-      const rateLimit = options.rateLimit;
-      if (rateLimit === undefined) {
-        return { kind: "allow", identity: verified.identity, headers: {} };
+      if (admission.rateLimit === undefined) {
+        return { kind: "allow", identity: admission.identity, headers: {} };
       }
-
-      const identifier = rateLimit.identify
-        ? await rateLimit.identify({ identity: verified.identity, headers })
-        : verified.identity.keyId;
-      if (typeof identifier !== "string" || identifier.length === 0) {
-        throw new Error("rate limit identifier must be a non-empty string");
-      }
-
-      const result = await readConsume(options.backend, {
-        identifier,
-        limit: rateLimit.limit,
-        windowMs: rateLimit.windowMs,
-        cost,
-        now,
-      });
-      if (isDecision(result)) return result;
-
-      const quota: Quota = {
-        name: policyName,
-        limit: result.limit,
-        remaining: result.remaining,
-        reset: result.reset,
-        windowMs: rateLimit.windowMs,
-      };
-      if (!result.success) return rateLimitedDecision(quota, now);
       return {
         kind: "allow",
-        identity: verified.identity,
-        rateLimit: quota,
-        headers: rateLimitHeaders(quota, now, false),
+        identity: admission.identity,
+        rateLimit: admission.rateLimit,
+        headers: rateLimitHeaders(admission.rateLimit, now, false),
       };
     },
   };
